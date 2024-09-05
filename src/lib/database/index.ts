@@ -1,12 +1,12 @@
 import {
-  applyOperation,
-  resolveChanges,
-  insertChanges,
-  updateVersion,
-  selectVersion,
-  changesSince,
-  selectClient,
-  finalize,
+	applyOperation,
+	resolveChanges,
+	insertChanges,
+	updateVersion,
+	selectVersion,
+	changesSince,
+	selectClient,
+	finalize,
 } from "./operations";
 import type { Connection, Schema } from "../core/types";
 import { Kysely, SqliteDialect } from "kysely";
@@ -18,46 +18,57 @@ import { apply } from "./schema";
 
 const connections = new Map();
 const defaultPaths = {} as {
-  wasm?: string;
-  binding?: string;
-  extension?: string;
+	wasm?: string;
+	binding?: string;
+	extension?: string;
 };
 
 async function init<T extends CRSchema>(
-  file: string,
-  schema: T,
-  paths = defaultPaths,
+	file: string,
+	schema: T,
+	paths = defaultPaths,
 ) {
-  type DB = Schema<T>;
-  if (connections.has(file)) return connections.get(file) as Connection<DB>;
+	const logger = {
+		log: (...params: any[]) => console.log("[crstore init]", ...params),
+	};
+	logger.log("started");
 
-  const { database, env } = await load(file, paths);
-  const Dialect = env === "browser" ? CRDialect : SqliteDialect;
-  const kysely = new Kysely<DB>({
-    dialect: new Dialect({ database }),
-    plugins: [new JSONPlugin()],
-  });
+	type DB = Schema<T>;
+	if (connections.has(file)) {
+		logger.log("connection already exists, returning");
+		return connections.get(file) as Connection<DB>;
+	}
 
-  const close = kysely.destroy.bind(kysely);
-  await kysely.transaction().execute((db) => apply(db, schema));
+	logger.log("loading runtime...");
+	const { database, env } = await load(file, paths);
 
-  const connection = Object.assign(kysely, {
-    resolveChanges,
-    applyOperation,
-    insertChanges,
-    updateVersion,
-    selectVersion,
-    selectClient,
-    changesSince,
-    async destroy() {
-      connections.delete(file);
-      await finalize.bind(kysely)().execute();
-      return close();
-    },
-  }) as Connection<DB>;
+	const Dialect = env === "browser" ? CRDialect : SqliteDialect;
+	const kysely = new Kysely<DB>({
+		dialect: new Dialect({ database }),
+		plugins: [new JSONPlugin()],
+	});
 
-  connections.set(file, connection);
-  return connection;
+	logger.log("applying schema...");
+	const close = kysely.destroy.bind(kysely);
+	await kysely.transaction().execute((db) => apply(db, schema));
+
+	const connection = Object.assign(kysely, {
+		resolveChanges,
+		applyOperation,
+		insertChanges,
+		updateVersion,
+		selectVersion,
+		selectClient,
+		changesSince,
+		async destroy() {
+			connections.delete(file);
+			await finalize.bind(kysely)().execute();
+			return close();
+		},
+	}) as Connection<DB>;
+
+	connections.set(file, connection);
+	return connection;
 }
 
 export { init, defaultPaths };

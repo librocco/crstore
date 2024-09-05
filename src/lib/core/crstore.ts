@@ -1,17 +1,17 @@
 import type {
-  EncodedChanges,
-  Operation,
-  CoreDatabase,
-  Actions,
-  Context,
-  Updater,
-  QueryId,
-  Schema,
-  Bound,
-  Error,
-  Pull,
-  Push,
-  View,
+	EncodedChanges,
+	Operation,
+	CoreDatabase,
+	Actions,
+	Context,
+	Updater,
+	QueryId,
+	Schema,
+	Bound,
+	Error,
+	Pull,
+	Push,
+	View,
 } from "./types";
 import { affectedTables } from "../database/operations";
 import type { CRSchema } from "../database/schema";
@@ -21,225 +21,240 @@ import type { CompiledQuery } from "kysely";
 import { queue } from "../database/queue";
 
 function database<T extends CRSchema>(
-  schema: T,
-  {
-    ssr = false,
-    name = "crstore.db",
-    paths = defaultPaths,
-    error = undefined as Error,
-    push: remotePush = undefined as Push,
-    pull: remotePull = undefined as Pull,
-    online = () => !!(globalThis as any).navigator?.onLine,
-  } = {},
+	schema: T,
+	{
+		ssr = false,
+		name = "crstore.db",
+		paths = defaultPaths,
+		error = undefined as Error,
+		push: remotePush = undefined as Push,
+		pull: remotePull = undefined as Pull,
+		online = () => !!(globalThis as any).navigator?.onLine,
+	} = {},
 ): CoreDatabase<Schema<T>> {
-  const dummy = !ssr && !!import.meta.env?.SSR;
-  const connection = dummy
-    ? new Promise<never>(() => {})
-    : init(name, schema, paths);
-  const channel =
-    "BroadcastChannel" in globalThis
-      ? new globalThis.BroadcastChannel(`${name}-sync`)
-      : null;
-  const tabUpdate = (event: MessageEvent) => trigger(event.data, event.data[0]);
-  const write = queue(connection, trigger);
-  const read = queue(connection);
+	const dummy = !ssr && !!import.meta.env?.SSR;
 
-  channel?.addEventListener("message", tabUpdate);
-  globalThis.addEventListener?.("online", pull);
+	const logger = {
+		log: (...params: any[]) => console.log("[crstore core]", ...params),
+	};
 
-  const listeners = new Map<string, Set<Updater>>();
-  let hold = () => {};
-  pull();
+	logger.log("dummy: ", dummy);
+	if (!dummy) {
+		logger.log("creating db...");
+	}
 
-  async function refresh(query: CompiledQuery, id: QueryId) {
-    return read
-      .enqueue(id, (db) => db.getExecutor().executeQuery(query, id))
-      .then((x) => x.rows);
-  }
+	const connection = dummy
+		? new Promise<never>(() => {})
+		: init(name, schema, paths);
 
-  function subscribe(
-    tables: string[],
-    callback: Updater,
-    options?: { client: string; version: number },
-  ) {
-    const listener = async (changes: EncodedChanges, sender?: string) => {
-      try {
-        if (options && options.client === sender) return;
-        await callback(changes, sender);
-      } catch (reason) {
-        error?.(reason);
-      }
-    };
+	const channel =
+		"BroadcastChannel" in globalThis
+			? new globalThis.BroadcastChannel(`${name}-sync`)
+			: null;
+	const tabUpdate = (event: MessageEvent) =>
+		trigger(event.data, event.data[0]);
+	const write = queue(connection, trigger);
+	const read = queue(connection);
 
-    tables.forEach((x) => {
-      if (!listeners.has(x)) listeners.set(x, new Set());
-      listeners.get(x)?.add(listener);
-    });
+	channel?.addEventListener("message", tabUpdate);
+	globalThis.addEventListener?.("online", pull);
 
-    // Immediately call when have options
-    if (options) {
-      connection.then(async (db) => {
-        const changes = await db
-          .changesSince(options.version, {
-            filter: options.client,
-            chunk: true,
-          })
-          .execute();
-        if (changes.length) changes.forEach((x) => listener(x));
-      });
-    } else listener("");
+	const listeners = new Map<string, Set<Updater>>();
+	let hold = () => {};
+	pull();
 
-    return () => tables.forEach((x) => listeners.get(x)?.delete(listener));
-  }
+	async function refresh(query: CompiledQuery, id: QueryId) {
+		return read
+			.enqueue(id, (db) => db.getExecutor().executeQuery(query, id))
+			.then((x) => x.rows);
+	}
 
-  async function push() {
-    if (!remotePush || !online()) return;
-    const db = await connection;
+	function subscribe(
+		tables: string[],
+		callback: Updater,
+		options?: { client: string; version: number },
+	) {
+		const listener = async (changes: EncodedChanges, sender?: string) => {
+			try {
+				if (options && options.client === sender) return;
+				await callback(changes, sender);
+			} catch (reason) {
+				error?.(reason);
+			}
+		};
 
-    const { current, synced } = await db.selectVersion().execute();
-    if (current <= synced) return;
+		tables.forEach((x) => {
+			if (!listeners.has(x)) listeners.set(x, new Set());
+			listeners.get(x)?.add(listener);
+		});
 
-    const changes = await db
-      .changesSince(synced, { filter: null, chunk: true })
-      .execute();
+		// Immediately call when have options
+		if (options) {
+			connection.then(async (db) => {
+				const changes = await db
+					.changesSince(options.version, {
+						filter: options.client,
+						chunk: true,
+					})
+					.execute();
+				if (changes.length) changes.forEach((x) => listener(x));
+			});
+		} else listener("");
 
-    await Promise.all(changes.map(remotePush));
-    await db.updateVersion(current).execute();
-  }
+		return () => tables.forEach((x) => listeners.get(x)?.delete(listener));
+	}
 
-  async function pull() {
-    globalThis.removeEventListener?.("offline", hold);
-    hold();
+	async function push() {
+		if (!remotePush || !online()) return;
+		const db = await connection;
 
-    if (!remotePull || !online()) return;
-    const db = await connection;
-    const { synced: version } = await db.selectVersion().execute();
-    const client = await db.selectClient().execute();
+		const { current, synced } = await db.selectVersion().execute();
+		if (current <= synced) return;
 
-    await push();
-    hold = remotePull(
-      { version, client },
-      {
-        async onData(changes) {
-          if (!changes.length) return;
-          await db.insertChanges(changes).execute();
-          await trigger(changes, changes[0]);
-        },
-      },
-    ).unsubscribe;
-    globalThis.addEventListener?.("offline", hold);
-  }
+		const changes = await db
+			.changesSince(synced, { filter: null, chunk: true })
+			.execute();
 
-  async function update<T extends any[], R>(
-    operation: Operation<T, R>,
-    ...args: T
-  ) {
-    return write.enqueue({}, operation, ...args);
-  }
+		await Promise.all(changes.map(remotePush));
+		await db.updateVersion(current).execute();
+	}
 
-  async function merge(changes: EncodedChanges) {
-    if (!changes.length) return;
-    const db = await connection;
-    await trigger(await db.resolveChanges(changes).execute(), changes[0]);
-  }
+	async function pull() {
+		globalThis.removeEventListener?.("offline", hold);
+		hold();
 
-  async function trigger(changes: EncodedChanges, sender?: string) {
-    if (!changes.length) return;
-    const callbacks = new Set<Updater>();
-    const tables = affectedTables(changes);
+		if (!remotePull || !online()) return;
+		const db = await connection;
+		const { synced: version } = await db.selectVersion().execute();
+		const client = await db.selectClient().execute();
 
-    listeners.get("*")?.forEach((x) => callbacks.add(x));
-    tables.forEach((table) =>
-      listeners.get(table)?.forEach((x) => callbacks.add(x)),
-    );
+		await push();
+		hold = remotePull(
+			{ version, client },
+			{
+				async onData(changes) {
+					if (!changes.length) return;
+					await db.insertChanges(changes).execute();
+					await trigger(changes, changes[0]);
+				},
+			},
+		).unsubscribe;
+		globalThis.addEventListener?.("offline", hold);
+	}
 
-    const promises = [...callbacks].map((x) => x(changes, sender));
-    if (!sender) {
-      channel?.postMessage(changes);
-      await push();
-    }
+	async function update<T extends any[], R>(
+		operation: Operation<T, R>,
+		...args: T
+	) {
+		return write.enqueue({}, operation, ...args);
+	}
 
-    await Promise.all(promises);
-  }
+	async function merge(changes: EncodedChanges) {
+		if (!changes.length) return;
+		const db = await connection;
+		await trigger(await db.resolveChanges(changes).execute(), changes[0]);
+	}
 
-  async function close() {
-    hold();
-    channel?.close();
-    listeners.clear();
-    globalThis.removeEventListener?.("online", pull);
-    globalThis.removeEventListener?.("offline", hold);
-    channel?.removeEventListener("message", tabUpdate);
-    await connection.then((x) => x.destroy());
-  }
+	async function trigger(changes: EncodedChanges, sender?: string) {
+		if (!changes.length) return;
+		const callbacks = new Set<Updater>();
+		const tables = affectedTables(changes);
 
-  return {
-    close,
-    merge,
-    update,
-    subscribe,
-    connection,
-    replica: store.bind({
-      connection,
-      subscribe,
-      update,
-      refresh,
-    } as any) as any,
-  };
+		listeners.get("*")?.forEach((x) => callbacks.add(x));
+		tables.forEach((table) =>
+			listeners.get(table)?.forEach((x) => callbacks.add(x)),
+		);
+
+		const promises = [...callbacks].map((x) => x(changes, sender));
+		if (!sender) {
+			channel?.postMessage(changes);
+			await push();
+		}
+
+		await Promise.all(promises);
+	}
+
+	async function close() {
+		hold();
+		channel?.close();
+		listeners.clear();
+		globalThis.removeEventListener?.("online", pull);
+		globalThis.removeEventListener?.("offline", hold);
+		channel?.removeEventListener("message", tabUpdate);
+		await connection.then((x) => x.destroy());
+	}
+
+	return {
+		close,
+		merge,
+		update,
+		subscribe,
+		connection,
+		replica: store.bind({
+			connection,
+			subscribe,
+			update,
+			refresh,
+		} as any) as any,
+	};
 }
 
 function store<Schema, Type>(
-  this: Context<Schema>,
-  view: View<Schema, Type>,
-  actions: Actions<Schema> = {},
-  dependencies: unknown[] = [],
+	this: Context<Schema>,
+	view: View<Schema, Type>,
+	actions: Actions<Schema> = {},
+	dependencies: unknown[] = [],
 ) {
-  const { connection, update, refresh: read } = this;
+	const { connection, update, refresh: read } = this;
 
-  let query = null as CompiledQuery | null;
-  let id = null as QueryId | null;
+	let query = null as CompiledQuery | null;
+	let id = null as QueryId | null;
 
-  const { subscribe, set, bind } = reactive<Type[], typeof dependencies>(
-    async (...values) => {
-      const db = await connection;
-      const node = view(db, ...(values as [])).toOperationNode();
-      const tables = affectedTables(node);
-      const executor = db.getExecutor();
+	const { subscribe, set, bind } = reactive<Type[], typeof dependencies>(
+		async (...values) => {
+			const db = await connection;
+			const node = view(db, ...(values as [])).toOperationNode();
+			const tables = affectedTables(node);
+			const executor = db.getExecutor();
 
-      id = { queryId: Math.random().toString(36).slice(2) };
-      query = executor.compileQuery(executor.transformQuery(node, id), id);
+			id = { queryId: Math.random().toString(36).slice(2) };
+			query = executor.compileQuery(
+				executor.transformQuery(node, id),
+				id,
+			);
 
-      return this.subscribe(tables, refresh);
-    },
-    dependencies,
-  );
+			return this.subscribe(tables, refresh);
+		},
+		dependencies,
+	);
 
-  async function refresh() {
-    await connection;
-    if (!query || !id) return;
-    set(await read<Type>(query, id));
-  }
+	async function refresh() {
+		await connection;
+		if (!query || !id) return;
+		set(await read<Type>(query, id));
+	}
 
-  const bound: Bound<Actions<Schema>> = {};
-  for (const name in actions) {
-    bound[name] = (...args: any[]) => update(actions[name], ...args);
-  }
+	const bound: Bound<Actions<Schema>> = {};
+	for (const name in actions) {
+		bound[name] = (...args: any[]) => update(actions[name], ...args);
+	}
 
-  return {
-    ...bound,
-    subscribe,
-    bind,
-    update<T extends any[], R>(operation?: Operation<T, R>, ...args: T) {
-      if (!operation) return refresh();
-      return update(operation, ...args);
-    },
-    then(resolve: (x: Type[]) => any = (x) => x, reject?: (e: any) => any) {
-      let data: Type[] = [];
-      const done = subscribe((x) => (data = x));
-      // It is hard to know whether the current store's state is dirty,
-      //   therefore we have to explicitly refresh it
-      return refresh().then(() => (done(), resolve?.(data)), reject);
-    },
-  };
+	return {
+		...bound,
+		subscribe,
+		bind,
+		update<T extends any[], R>(operation?: Operation<T, R>, ...args: T) {
+			if (!operation) return refresh();
+			return update(operation, ...args);
+		},
+		then(resolve: (x: Type[]) => any = (x) => x, reject?: (e: any) => any) {
+			let data: Type[] = [];
+			const done = subscribe((x) => (data = x));
+			// It is hard to know whether the current store's state is dirty,
+			//   therefore we have to explicitly refresh it
+			return refresh().then(() => (done(), resolve?.(data)), reject);
+		},
+	};
 }
 
 export { database, ready };
